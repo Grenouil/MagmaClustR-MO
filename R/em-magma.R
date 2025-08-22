@@ -7,11 +7,11 @@
 #'    Additional columns for covariates can be specified.
 #' @param m_0 A vector, corresponding to the prior mean of the mean GP.
 #' @param kern_0 A kernel function, associated with the mean GP.
-#' @param kern_i A kernel function, associated with the individual GPs.
+#' @param kern_t A kernel function, associated with the task GPs.
 #' @param hp_0 A named vector, tibble or data frame of hyper-parameters
 #'    associated with \code{kern_0}.
-#' @param hp_i A tibble or data frame of hyper-parameters
-#'    associated with \code{kern_i}.
+#' @param hp_t A tibble or data frame of hyper-parameters
+#'    associated with \code{kern_t}.
 #' @param pen_diag A number. A jitter term, added on the diagonal to prevent
 #'    numerical issues when inverting nearly singular matrices.
 #' @return A named list, containing the elements \code{mean}, a tibble
@@ -22,72 +22,189 @@
 #'
 #' @examples
 #' TRUE
+#'
+
 e_step <- function(db,
                    m_0,
                    kern_0,
-                   kern_i,
+                   kern_t,
                    hp_0,
-                   hp_i,
+                   hp_t,
                    pen_diag) {
-  ## Extract the union of all reference inputs provided in the training data
+
+  ## Part 1: Compute the prior inverse covariance for the mean process (mu_0)
+  # Get the union of all unique input points from the training data
   all_inputs <- db %>%
-    dplyr::select(-.data$ID, -.data$Output) %>%
+    dplyr::select(-c(Task_ID, Output)) %>%
     unique() %>%
-    dplyr::arrange(.data$Reference)
+    dplyr::arrange(Reference)
 
-  ## Compute all the inverse covariance matrices
-  inv_0 <- kern_to_inv(all_inputs, kern_0, hp_0, pen_diag)
-  list_inv_i <- list_kern_to_inv(db, kern_i, hp_i, pen_diag)
-  ## Create a named list of Output values for all individuals
-  list_output_i <- base::split(db$Output, list(db$ID))
+  # Compute the inverse covariance matrix for each output block of the mean process
+  # This assumes the prior on mu_0 treats outputs as independent GPs.
+  list_inv_0 <- list_outputs_blocks_to_inv(db = db,
+                                           kern = kern_0,
+                                           hp = hp_0,
+                                           pen_diag = pen_diag)
 
-  ## Update the posterior inverse covariance ##
+  # Create the full block-diagonal inverse covariance matrix for mu_0
+  inv_0 <- Matrix::bdiag(list_inv_0)
+
+  # Set the row and column names of inv_0
+  all_references <- unlist(lapply(list_inv_0, rownames), use.names = FALSE)
+  dimnames(inv_0) <- list(all_references, all_references)
+  inv_0 <- as.matrix(inv_0)
+
+  ## Part 2: Compute the inverse covariance for each task
+  list_inv_t <- list()
+  list_ID_task <- unique(db$Task_ID)
+
+  # For each task, compute its full multi-output inverse covariance matrix
+  for (t in list_ID_task) {
+
+    # Isolate the data and HPs for the current task
+    db_t <- db %>% dplyr::filter(Task_ID == t)
+    hp_t_indiv <- hp_t %>% dplyr::filter(Task_ID == t)
+
+    # Call kern_to_cov directly.
+    # It will handle the multi-output structure and the noise addition internally.
+    # 'kern_t' is expected to be the 'convolution_kernel' function.
+    K_task_t <- kern_to_cov(
+      input = db_t,
+      kern = kern_t,
+      hp = hp_t_indiv
+    )
+
+    # Store the correct row/column names before they are lost during inversion
+    task_references <- rownames(K_task_t)
+
+    # Invert the covariance matrix (this strips the names)
+    K_inv_t <- K_task_t %>% chol_inv_jitter(pen_diag = pen_diag)
+
+    # Re-apply the stored names to the inverted matrix
+    dimnames(K_inv_t) <- list(task_references, task_references)
+
+    # Add the inverted matrix to the list
+    # The rownames are already correctly set by kern_to_cov
+    list_inv_t[[t]] <- K_inv_t
+  }
+
+  ## Part 3: Update the posterior distribution
+  # Create a named list of output values, split by task
+  list_output_t <- base::split(db$Output, list(db$Task_ID))
+
+  ##--------------- Update Posterior Inverse Covariance ---------------##
   post_inv <- inv_0
-  for (inv_i in list_inv_i)
-  {
-    ## Collect the input's common indices between mean and individual processes
-    co_input <- intersect(row.names(inv_i), row.names(post_inv))
-    ## Sum the common inverse covariance's terms
+
+  for (inv_t in list_inv_t) {
+    # Find the common input points between the mean process and the current task
+    co_input <- intersect(row.names(inv_t), row.names(post_inv))
+
+    # Add the task's contribution to the posterior inverse covariance
     post_inv[co_input, co_input] <- post_inv[co_input, co_input] +
-      inv_i[co_input, co_input]
+      inv_t[co_input, co_input]
   }
 
   post_cov <- post_inv %>%
     chol_inv_jitter(pen_diag = pen_diag) %>%
-    `rownames<-`(all_inputs %>%
-                   dplyr::pull(.data$Reference)
-    ) %>%
-    `colnames<-`(all_inputs %>%
-                   dplyr::pull(.data$Reference)
-    )
-  ##############################################
+    `rownames<-`(all_inputs %>% dplyr::pull(.data$Reference)) %>%
+    `colnames<-`(all_inputs %>% dplyr::pull(.data$Reference))
 
-  ## Update the posterior mean ##
+  ##--------------------- Update Posterior Mean ---------------------##
   weighted_0 <- inv_0 %*% m_0
-  for (i in names(list_inv_i))
-  {
-    ## Compute the weighted mean for the i-th individual
-    weighted_i <- list_inv_i[[i]] %*% list_output_i[[i]]
-    ## Collect the input's common indices between mean and individual processes
-    co_input <- intersect(row.names(weighted_i), row.names(weighted_0))
-    ## Sum the common weighted mean's terms
-    weighted_0[co_input, ] <- weighted_0[co_input, ] +
-      weighted_i[co_input, ]
-  }
-  ## Compute the updated mean parameter
-  post_mean <- post_cov %*% weighted_0 %>% as.vector()
-  ##############################################
 
-  ## Format the mean parameter of the hyper-posterior distribution
+  for (t in names(list_inv_t)) {
+    # Compute the weighted mean for the t-th task
+    weighted_t <- list_inv_t[[t]] %*% list_output_t[[t]]
+
+    # Find the common input points between the mean process and the current task
+    co_input <- intersect(row.names(weighted_t), row.names(weighted_0))
+
+    # Add the task's contribution to the posterior weighted mean
+    weighted_0[co_input, ] <- weighted_0[co_input, ] +
+      weighted_t[co_input, ]
+  }
+
+  # Compute the final posterior mean
+  post_mean <- post_cov %*% weighted_0 %>% as.vector()
+
+  ## Part 4: Format and return the results
+  # Format the posterior mean into a tibble
   tib_mean <- tibble::tibble(all_inputs,
-                             "Output" = post_mean
-  )
-  list(
+                             "Output" = post_mean)
+
+  return(list(
     "mean" = tib_mean,
     "cov" = post_cov
-  ) %>%
-    return()
+  ))
 }
+
+
+# e_step <- function(db,
+#                    m_0,
+#                    kern_0,
+#                    kern_i,
+#                    hp_0,
+#                    hp_i,
+#                    pen_diag) {
+#   ## Extract the union of all reference inputs provided in the training data
+#   all_inputs <- db %>%
+#     dplyr::select(-.data$ID, -.data$Output) %>%
+#     unique() %>%
+#     dplyr::arrange(.data$Reference)
+#
+#   ## Compute all the inverse covariance matrices
+#   inv_0 <- kern_to_inv(all_inputs, kern_0, hp_0, pen_diag)
+#   list_inv_i <- list_kern_to_inv(db, kern_i, hp_i, pen_diag)
+#   ## Create a named list of Output values for all individuals
+#   list_output_i <- base::split(db$Output, list(db$ID))
+#
+#   ## Update the posterior inverse covariance ##
+#   post_inv <- inv_0
+#   for (inv_i in list_inv_i)
+#   {
+#     ## Collect the input's common indices between mean and individual processes
+#     co_input <- intersect(row.names(inv_i), row.names(post_inv))
+#     ## Sum the common inverse covariance's terms
+#     post_inv[co_input, co_input] <- post_inv[co_input, co_input] +
+#       inv_i[co_input, co_input]
+#   }
+#
+#   post_cov <- post_inv %>%
+#     chol_inv_jitter(pen_diag = pen_diag) %>%
+#     `rownames<-`(all_inputs %>%
+#                    dplyr::pull(.data$Reference)
+#     ) %>%
+#     `colnames<-`(all_inputs %>%
+#                    dplyr::pull(.data$Reference)
+#     )
+#   ##############################################
+#
+#   ## Update the posterior mean ##
+#   weighted_0 <- inv_0 %*% m_0
+#   for (i in names(list_inv_i))
+#   {
+#     ## Compute the weighted mean for the i-th individual
+#     weighted_i <- list_inv_i[[i]] %*% list_output_i[[i]]
+#     ## Collect the input's common indices between mean and individual processes
+#     co_input <- intersect(row.names(weighted_i), row.names(weighted_0))
+#     ## Sum the common weighted mean's terms
+#     weighted_0[co_input, ] <- weighted_0[co_input, ] +
+#       weighted_i[co_input, ]
+#   }
+#   ## Compute the updated mean parameter
+#   post_mean <- post_cov %*% weighted_0 %>% as.vector()
+#   ##############################################
+#
+#   ## Format the mean parameter of the hyper-posterior distribution
+#   tib_mean <- tibble::tibble(all_inputs,
+#                              "Output" = post_mean
+#   )
+#   list(
+#     "mean" = tib_mean,
+#     "cov" = post_cov
+#   ) %>%
+#     return()
+# }
 
 
 #' M-Step of the EM algorithm

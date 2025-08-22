@@ -102,6 +102,8 @@ gr_GP_mod <- function(hp,
     return()
 }
 
+
+
 #' Gradient of the modified logLikelihood with common HPs for GPs in Magma
 #'
 #' @param hp A tibble or data frame containing hyper-parameters for all

@@ -131,6 +131,7 @@ logL_GP_mod <- function(hp, db, mean, kern, post_cov, pen_diag) {
   return(LL_norm + cor_term)
 }
 
+
 #' Modified log-Likelihood function with common HPs for GPs
 #'
 #' Log-Likelihood function involved in Magma during the maximisation step of
