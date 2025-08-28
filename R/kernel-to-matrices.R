@@ -67,10 +67,10 @@ kern_to_cov <- function(input,
     )
   }
 
+  browser()
   ## Treat the convolution kernel appart from other kernels
-  is_conv_kern <- (is.function(kern) && identical(kern, convolution_kernel))
-
-  if (is_conv_kern) {
+  if (kern %>% is_function() && length(input$Output_ID %>% unique()) > 1
+                             && is.null(deriv)) {
     # Need a unique dataframe, containing all observed inputs of all outputs.
     # The convolution_kernel() function generates the whole multioutputs
     # covariance matrix.
@@ -81,27 +81,21 @@ kern_to_cov <- function(input,
 
     # We select ONLY the columns that uniquely define a point (coordinates + Output_ID)
     # to ensure consistent naming across different function calls.
-    cols_for_naming <- c(dplyr::starts_with("Input", vars = names(input)), "Output_ID")
+    # 1. Dynamically find all coordinate columns (starting with "Input")
+    coord_cols <- grep("^Input", names(input), value = TRUE)
 
-    input_for_naming <- dplyr::select(input, dplyr::all_of(cols_for_naming))
-    reference <- tidyr::unite(
-      input_for_naming,
-      'Reference',
-      tidyselect::everything(),
-      sep = ':'
-    ) %>% dplyr::pull(.data$Reference) %>% as.character()
+    # 2. Paste the coordinate values together for each row
+    pasted_coords <- do.call(paste, c(input[coord_cols], sep = ";"))
+
+    # 3. Prepend the output ID to create the final name
+    reference <- paste0("o", input$Output_ID, ";", pasted_coords)
 
     # Do the same for the second set of inputs if it's different
     if (identical(input, input_2)) {
       reference_2 <- reference
     } else {
-      input_2_for_naming <- dplyr::select(input_2, dplyr::all_of(cols_for_naming))
-      reference_2 <- tidyr::unite(
-        input_2_for_naming,
-        'Reference',
-        tidyselect::everything(),
-        sep = ':'
-      ) %>% dplyr::pull(.data$Reference) %>% as.character()
+      pasted_coords_2 <- do.call(paste, c(input_2[coord_cols], sep = ";"))
+      reference_2 <- paste0("o", input_2$Output_ID, ";", pasted_coords_2)
     }
 
     ## Add a 'noise' term on the diagonal if provided
@@ -334,7 +328,7 @@ kern_to_cov <- function(input,
       reference <- input$Reference %>% as.character()
 
       ## Only retain the actual input columns
-      input <- input %>% dplyr::select(-.data$Reference)
+      input <- input %>% dplyr::select(-c(.data$Reference))
 
       ## Format inputs to be used in a subsequent 'outer()' function
       list_input <- split(t(input),
@@ -381,6 +375,79 @@ kern_to_cov <- function(input,
 
   ## Return the derivative of the noise if required
   if (!is.null(deriv)) {
+    if (length(input$Output_ID %>% unique()) > 1){
+      if (any(startsWith(deriv, "noise"))){
+        # --- DÉBUT DES CORRECTIONS ---
+
+        # 1. Extraire l'ID de l'hyperparamètre (ex: "noise_2" -> 2)
+        deriv_id_str <- stringr::str_extract(deriv, "\\d+$")
+        if (is.na(deriv_id_str)) {
+          stop("Le nom de la dérivée du bruit doit contenir un ID, ex: 'noise_1'")
+        }
+        deriv_id <- as.integer(deriv_id_str)
+
+        # --- FIN DES CORRECTIONS ---
+
+        # Le tri est toujours nécessaire pour construire la matrice dans le bon ordre
+        input <- input %>% dplyr::arrange(Output_ID)
+        if ("Task_ID" %in% colnames(input)) {
+          input <- input %>% dplyr::select(-Task_ID)
+        }
+        input_2 <- input_2 %>% dplyr::arrange(Output_ID)
+        if ("Task_ID" %in% colnames(input_2)) {
+          input_2 <- input_2 %>% dplyr::select(-Task_ID)
+        }
+
+        unique_ids <- unique(input$Output_ID)
+        list_of_blocks <- list()
+
+        for (id in unique_ids) {
+          subset_input <- input %>% dplyr::filter(Output_ID == id)
+          subset_input_2 <- input_2 %>% dplyr::filter(Output_ID == id)
+
+          # --- DÉBUT DES CORRECTIONS ---
+
+          # 2. Condition : on ne calcule le bloc que si l'ID correspond
+          if (id == deriv_id) {
+            # Si l'ID de la boucle correspond à celui de la dérivée,
+            # on calcule le bloc de bruit comme avant.
+            current_noise_hp <- hp %>%
+              dplyr::filter(Output_ID == id) %>%
+              pull(noise)
+
+            if (length(current_noise_hp) == 0) {
+              stop(paste("'Noise' parameter not found for Output_ID :", id))
+            }
+
+            block_matrix <- cpp_noise(
+              as.matrix(select(subset_input, -Output_ID)),
+              as.matrix(select(subset_input_2, -Output_ID)),
+              current_noise_hp
+            )
+          } else {
+            # Sinon, la dérivée est nulle. On crée un bloc de zéros
+            # de la bonne dimension.
+            block_matrix <- matrix(0,
+                                   nrow = nrow(subset_input),
+                                   ncol = nrow(subset_input_2))
+          }
+
+          # --- FIN DES CORRECTIONS ---
+
+          list_of_blocks[[as.character(id)]] <- block_matrix
+        }
+
+        # Aggregate blocks into the complete block-diagonal matrix
+        mat <- Matrix::bdiag(list_of_blocks)
+        mat <- as.matrix(mat)
+
+        rownames(mat) <- rownames(input)
+        colnames(mat) <- rownames(input_2)
+
+        return(mat)
+      }
+    }
+
     if (deriv == "noise") {
       mat <- cpp_noise(as.matrix(input),
                        as.matrix(input_2),

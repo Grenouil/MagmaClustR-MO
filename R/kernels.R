@@ -4,68 +4,200 @@
 #'   a tibble/data.frame containing the coordinates and an 'Output_ID' column.
 #' @param y The second input data (must have the same format as x).
 #' @param hp For the vectorized multi-output case, this must be a tibble
-#'   containing the hyperparameters 'l_t', 'S_t', 'l_u_t' and an 'Output_ID' column.
-#' @param vectorized If TRUE, enables the calculation of the full MO covariance matrix.
-#' @return The covariance matrix.
-
+#'   containing the hyperparameters 'l_t', 'S_t', 'l_u_t' and an 'Output_ID'
+#'   column.
+#' @param vectorized If TRUE, enables the calculation of the full MO covariance
+#'   matrix.
+#' @param deriv A character string specifying the partial derivative to compute.
+#'   Can be one of "l_t_1", "l_t_2", "S_t_1", "S_t_2", "l_u_t".
+#' @return The covariance matrix or its partial derivative.
+#'
+#'
 convolution_kernel <- function(x,
                                y,
                                hp,
-                               vectorized = FALSE) {
-
-  # ----- NON-VECTORIZED CASE -----
-  # Handles the calculation between two single points.
+                               vectorized = FALSE,
+                               deriv = NULL) {
+  # Le bloc non-vectorisé est principalement pour les calculs point par point
   if (!vectorized) {
-    l_1 <- exp(hp[["lengthscale_output1"]])
-    l_2 <- exp(hp[["lengthscale_output2"]])
+    l_i <- exp(hp[["lengthscale_output1"]])
+    l_j <- exp(hp[["lengthscale_output2"]])
     l_u <- exp(hp[["lengthscale_u"]])
-    S_1 <- exp(hp[["variance_output1"]])
-    S_2 <- exp(hp[["variance_output2"]])
-    distance <- sum((x - y)^2)
-    top_term <- - (l_1 + l_2 + l_u)^(-1) * 0.5 * distance
-    return(((S_1 * S_2 / ((2*pi)^(0.5)*(l_1 + l_2 + l_u)^(0.5))) * exp(top_term)))
+    S_i <- exp(hp[["variance_output1"]])
+    S_j <- exp(hp[["variance_output2"]])
+
+    distance_sq     <- sum((x - y)^2)
+    denominator_sum <- l_i + l_j + l_u
+    S_prod          <- S_i * S_j
+
+    pre_factor <- S_prod / sqrt(2 * pi * denominator_sum)
+    exp_term <- exp(-0.5 * distance_sq / denominator_sum)
+    K <- pre_factor * exp_term
+
+  } else {
+    # --- Bloc vectorisé pour construire la matrice de covariance complète ---
+    if (!"Output_ID" %in% names(x) || !"Output_ID" %in% names(hp)) {
+      stop("'input' and 'hp' must contain an 'Output_ID' column for vectorized mode.")
+    }
+
+    # Préparation des données et des hyperparamètres
+    coord_cols <- names(x)[sapply(x, is.numeric) & names(x) != "Output_ID"]
+    x_coords <- as.matrix(x[, coord_cols, drop = FALSE])
+    y_coords <- as.matrix(y[, coord_cols, drop = FALSE])
+
+    idx_x <- x$Output_ID
+    idx_y <- y$Output_ID
+
+    hp_ordered <- hp %>% dplyr::arrange(Output_ID)
+    l_outputs <- hp_ordered$l_t
+    S_outputs <- hp_ordered$S_t
+    l_u_val <- exp(hp_ordered$l_u_t[1])
+
+    l_vec_1 <- exp(l_outputs[idx_x])
+    l_vec_2 <- exp(l_outputs[idx_y])
+    S_vec_1 <- exp(S_outputs[idx_x])
+    S_vec_2 <- exp(S_outputs[idx_y])
+
+    # Calcul des composantes sous forme de matrices
+    distance_sq     <- cpp_dist(x_coords, y_coords)
+    denominator_sum <- outer(l_vec_1, l_vec_2, FUN = "+") + l_u_val
+    S_prod          <- outer(S_vec_1, S_vec_2, FUN = "*")
+
+    pre_factor <- S_prod / sqrt(2 * pi * denominator_sum)
+    exp_term   <- exp(-0.5 * distance_sq / denominator_sum)
+    K          <- pre_factor * exp_term
   }
 
-  # ----- VECTORIZED CASE -----
-
-  # 1. Input checks
-  if (!"Output_ID" %in% names(x) || !"Output_ID" %in% names(hp)) {
-    stop("For the vectorized convolution kernel, 'input' and 'hp' must contain an 'Output_ID' column.")
+  if (is.null(deriv)) {
+    return(K)
   }
 
-  # 2. Separate coordinates from output indices
-  #    We exclude non-numeric columns to get the coordinates.
-  coord_cols <- names(x)[sapply(x, is.numeric) & names(x) != "Output_ID"]
-  x_coords <- as.matrix(x[, coord_cols, drop = FALSE])
-  y_coords <- as.matrix(y[, coord_cols, drop = FALSE])
-  idx_x <- x$Output_ID
-  idx_y <- y$Output_ID
+  # --- CALCUL DES DÉRIVÉES PARTIELLES (CORRIGÉ) ---
 
-  # 3. Prepare hyperparameter vectors
-  #    Ensure HPs are correctly sorted by Output_ID to guarantee alignment.
-  hp_ordered <- hp %>% dplyr::arrange(Output_ID)
+  hp_id_str <- stringr::str_extract(deriv, "\\d+$")
+  if (is.na(hp_id_str) && deriv != "l_u_t") {
+    stop("Le nom de la dérivée doit se terminer par un ID numérique, ex: 'l_t_1'.")
+  }
+  hp_id <- as.integer(hp_id_str)
 
-  l_outputs <- hp_ordered$l_t
-  S_outputs <- hp_ordered$S_t
-  l_u <- hp_ordered$l_u_t[1] # Assume l_u is shared across outputs for a given task
+  if (startsWith(deriv, "l_t_")) {
+    # Formule de base (inchangée)
+    common_deriv_denom <- K * ((-0.5 / denominator_sum) + (0.5 * distance_sq / (denominator_sum^2)))
 
-  # 4. Compute the covariance matrix (meta-kernel logic)
-  distance_matrix_sq <- cpp_dist(x_coords, y_coords)
+    # Règle de dérivation en chaîne (inchangée)
+    chain_rule_factor <- exp(l_outputs[hp_id])
 
-  l_vec_x <- exp(l_outputs[idx_x])
-  l_vec_y <- exp(l_outputs[idx_y])
-  S_vec_x <- exp(S_outputs[idx_x])
-  S_vec_y <- exp(S_outputs[idx_y])
+    # --- CORRECTION : Création d'une matrice de facteurs ---
+    N <- nrow(x)
+    M <- nrow(y)
+    mask_i_is_k <- outer(idx_x == hp_id, rep(TRUE, M))
+    mask_j_is_k <- outer(rep(TRUE, N), idx_y == hp_id)
 
-  l_sum_mat <- outer(l_vec_x, l_vec_y, FUN = "+")
-  S_prod_mat <- outer(S_vec_x, S_vec_y, FUN = "*")
+    # On additionne les masques booléens (TRUE=1, FALSE=0).
+    # Sur un bloc diagonal (k,k), mask_i_is_k et mask_j_is_k sont tous deux TRUE,
+    # donc leur somme vaut 2. Ailleurs, elle vaut 1 ou 0.
+    factor_matrix <- mask_i_is_k + mask_j_is_k
 
-  denominator_sum <- l_sum_mat + exp(l_u)
-  top_term_mat <- -0.5 * distance_matrix_sq / denominator_sum
-  pre_factor_mat <- S_prod_mat / sqrt(2 * pi * denominator_sum)
+    return(common_deriv_denom * chain_rule_factor * factor_matrix)
+  } else if (startsWith(deriv, "S_t_")) {
+    # La dérivée par rapport à log(S_k) est K * (I(i=k) + I(j=k))
+    # où I est la fonction indicatrice.
+    N <- nrow(x)
+    M <- nrow(y)
+    mask_i_is_k <- outer(idx_x == hp_id, rep(TRUE, M))
+    mask_j_is_k <- outer(rep(TRUE, N), idx_y == hp_id)
 
-  return(pre_factor_mat * exp(top_term_mat))
+    # L'addition des masques booléens (convertis en 0/1) implémente (I(i=k) + I(j=k))
+    pd <- K * (mask_i_is_k + mask_j_is_k)
+    return(pd)
+
+  } else if (deriv == "l_u_t") {
+    # Formule corrigée pour la dépendance au dénominateur (avec D^2)
+    common_deriv_denom <- K * ((-0.5 / denominator_sum) + (0.5 * distance_sq / (denominator_sum^2)))
+
+    # Règle de dérivation en chaîne : on multiplie par l_u
+    chain_rule_factor <- l_u_val
+
+    # Pas de masque car l_u est partagé et affecte tous les blocs
+    return(common_deriv_denom * chain_rule_factor)
+
+  } else {
+    stop("Invalid 'deriv' argument.")
+  }
 }
+
+
+#' Compute the Covariance Matrix for a Multi-Output GP via Convolution
+#'
+#' @param x The input data. For the vectorized multi-output case, this must be
+#'   a tibble/data.frame containing the coordinates and an 'Output_ID' column.
+#' @param y The second input data (must have the same format as x).
+#' @param hp For the vectorized multi-output case, this must be a tibble
+#'   containing the hyperparameters 'l_t', 'S_t', 'l_u_t' and an 'Output_ID'
+#'   column.
+#' @param vectorized If TRUE, enables the calculation of the full MO covariance
+#'   matrix.
+#' @return The covariance matrix.
+
+# convolution_kernel <- function(x,
+#                                y,
+#                                hp,
+#                                vectorized = FALSE) {
+#
+#   # ----- NON-VECTORIZED CASE -----
+#   # Handles the calculation between two single points.
+#   if (!vectorized) {
+#     l_1 <- exp(hp[["lengthscale_output1"]])
+#     l_2 <- exp(hp[["lengthscale_output2"]])
+#     l_u <- exp(hp[["lengthscale_u"]])
+#     S_1 <- exp(hp[["variance_output1"]])
+#     S_2 <- exp(hp[["variance_output2"]])
+#     distance <- sum((x - y)^2)
+#     top_term <- - (l_1 + l_2 + l_u)^(-1) * 0.5 * distance
+#     return(((S_1 * S_2 / ((2*pi)^(0.5)*(l_1 + l_2 + l_u)^(0.5))) * exp(top_term)))
+#   }
+#
+#   # ----- VECTORIZED CASE -----
+#
+#   # 1. Input checks
+#   if (!"Output_ID" %in% names(x) || !"Output_ID" %in% names(hp)) {
+#     stop("For the vectorized convolution kernel, 'input' and 'hp' must contain",
+#          " an 'Output_ID' column.")
+#   }
+#
+#   # 2. Separate coordinates from output indices
+#   #    We exclude non-numeric columns to get the coordinates.
+#   coord_cols <- names(x)[sapply(x, is.numeric) & names(x) != "Output_ID"]
+#   x_coords <- as.matrix(x[, coord_cols, drop = FALSE])
+#   y_coords <- as.matrix(y[, coord_cols, drop = FALSE])
+#   idx_x <- x$Output_ID
+#   idx_y <- y$Output_ID
+#
+#   # 3. Prepare hyperparameter vectors
+#   #    Ensure HPs are correctly sorted by Output_ID to guarantee alignment.
+#   hp_ordered <- hp %>% dplyr::arrange(Output_ID)
+#
+#   l_outputs <- hp_ordered$l_t
+#   S_outputs <- hp_ordered$S_t
+#   l_u <- hp_ordered$l_u_t[1] # Assume l_u is shared across outputs for a given task
+#
+#   # 4. Compute the covariance matrix (meta-kernel logic)
+#   distance_matrix_sq <- cpp_dist(x_coords, y_coords)
+#
+#   l_vec_x <- exp(l_outputs[idx_x])
+#   l_vec_y <- exp(l_outputs[idx_y])
+#   S_vec_x <- exp(S_outputs[idx_x])
+#   S_vec_y <- exp(S_outputs[idx_y])
+#
+#   l_sum_mat <- outer(l_vec_x, l_vec_y, FUN = "+")
+#   S_prod_mat <- outer(S_vec_x, S_vec_y, FUN = "*")
+#
+#   denominator_sum <- l_sum_mat + exp(l_u)
+#   top_term_mat <- -0.5 * distance_matrix_sq / denominator_sum
+#   pre_factor_mat <- S_prod_mat / sqrt(2 * pi * denominator_sum)
+#
+#   return(pre_factor_mat * exp(top_term_mat))
+# }
 
 
 #' Squared Exponential Kernel

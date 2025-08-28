@@ -58,21 +58,38 @@ e_step <- function(db,
   list_inv_t <- list()
   list_ID_task <- unique(db$Task_ID)
 
+  list_output_ID <-  db$Output_ID %>% unique()
+
   # For each task, compute its full multi-output inverse covariance matrix
   for (t in list_ID_task) {
-
     # Isolate the data and HPs for the current task
-    db_t <- db %>% dplyr::filter(Task_ID == t)
+    db_t <- db %>% dplyr::filter(Task_ID == t) %>%
+                   dplyr::select(-Output)
     hp_t_indiv <- hp_t %>% dplyr::filter(Task_ID == t)
 
-    # Call kern_to_cov directly.
-    # It will handle the multi-output structure and the noise addition internally.
-    # 'kern_t' is expected to be the 'convolution_kernel' function.
-    K_task_t <- kern_to_cov(
-      input = db_t,
-      kern = kern_t,
-      hp = hp_t_indiv
-    )
+    if(length(list_output_ID) > 1){
+      # Call kern_to_cov directly.
+      # It will handle the multi-output structure and the noise addition internally.
+      # 'kern_t' is expected to be the 'convolution_kernel' function.
+      K_task_t <- kern_to_cov(
+        input = db_t,
+        kern = kern_t,
+        hp = hp_t_indiv
+      )
+    } else{
+      # Extract all_inputs to call kern_to_cov() on the single output case
+      all_inputs_t <- db %>%
+        dplyr::filter(Task_ID == t) %>%
+        dplyr::select(-c(Task_ID, Output, Output_ID)) %>%
+        unique() %>%
+        dplyr::arrange(Reference)
+
+      K_task_t <- kern_to_cov(
+        input = all_inputs_t,
+        kern = kern_t,
+        hp = hp_t_indiv
+      )
+    }
 
     # Store the correct row/column names before they are lost during inversion
     task_references <- rownames(K_task_t)
@@ -94,7 +111,6 @@ e_step <- function(db,
 
   ##--------------- Update Posterior Inverse Covariance ---------------##
   post_inv <- inv_0
-
   for (inv_t in list_inv_t) {
     # Find the common input points between the mean process and the current task
     co_input <- intersect(row.names(inv_t), row.names(post_inv))
@@ -139,225 +155,164 @@ e_step <- function(db,
 }
 
 
-# e_step <- function(db,
-#                    m_0,
-#                    kern_0,
-#                    kern_i,
-#                    hp_0,
-#                    hp_i,
-#                    pen_diag) {
-#   ## Extract the union of all reference inputs provided in the training data
-#   all_inputs <- db %>%
-#     dplyr::select(-.data$ID, -.data$Output) %>%
-#     unique() %>%
-#     dplyr::arrange(.data$Reference)
-#
-#   ## Compute all the inverse covariance matrices
-#   inv_0 <- kern_to_inv(all_inputs, kern_0, hp_0, pen_diag)
-#   list_inv_i <- list_kern_to_inv(db, kern_i, hp_i, pen_diag)
-#   ## Create a named list of Output values for all individuals
-#   list_output_i <- base::split(db$Output, list(db$ID))
-#
-#   ## Update the posterior inverse covariance ##
-#   post_inv <- inv_0
-#   for (inv_i in list_inv_i)
-#   {
-#     ## Collect the input's common indices between mean and individual processes
-#     co_input <- intersect(row.names(inv_i), row.names(post_inv))
-#     ## Sum the common inverse covariance's terms
-#     post_inv[co_input, co_input] <- post_inv[co_input, co_input] +
-#       inv_i[co_input, co_input]
-#   }
-#
-#   post_cov <- post_inv %>%
-#     chol_inv_jitter(pen_diag = pen_diag) %>%
-#     `rownames<-`(all_inputs %>%
-#                    dplyr::pull(.data$Reference)
-#     ) %>%
-#     `colnames<-`(all_inputs %>%
-#                    dplyr::pull(.data$Reference)
-#     )
-#   ##############################################
-#
-#   ## Update the posterior mean ##
-#   weighted_0 <- inv_0 %*% m_0
-#   for (i in names(list_inv_i))
-#   {
-#     ## Compute the weighted mean for the i-th individual
-#     weighted_i <- list_inv_i[[i]] %*% list_output_i[[i]]
-#     ## Collect the input's common indices between mean and individual processes
-#     co_input <- intersect(row.names(weighted_i), row.names(weighted_0))
-#     ## Sum the common weighted mean's terms
-#     weighted_0[co_input, ] <- weighted_0[co_input, ] +
-#       weighted_i[co_input, ]
-#   }
-#   ## Compute the updated mean parameter
-#   post_mean <- post_cov %*% weighted_0 %>% as.vector()
-#   ##############################################
-#
-#   ## Format the mean parameter of the hyper-posterior distribution
-#   tib_mean <- tibble::tibble(all_inputs,
-#                              "Output" = post_mean
-#   )
-#   list(
-#     "mean" = tib_mean,
-#     "cov" = post_cov
-#   ) %>%
-#     return()
-# }
+#' @title Maximisation Step of the EM Algorithm (Simplified)
+#' @description Computes the optimal hyper-parameters of the kernels involved in the model.
+#'
+#' @param db A tibble or data frame. Required columns: Task_ID, Output_ID, Input_1, Output, Reference.
+#' @param m_0 Prior mean vector for the mean GP.
+#' @param kern_0 Kernel function for the mean GP.
+#' @param kern_t Kernel function for the individual task GPs.
+#' @param old_hp_0 Hyper-parameters for the mean GP from the previous step.
+#' @param old_hp_t Hyper-parameters for the task GPs from the previous step.
+#' @param post_mean Posterior mean from the E-step.
+#' @param post_cov Posterior covariance from the E-step.
+#' @param shared_hp_tasks If TRUE, all tasks share the same hyper-parameter values.
+#' @param pen_diag A jitter term for matrix inversion.
+#'
+#' @return A list containing the updated hyper-parameters `hp_0` and `hp_t`.
+#'
 
-
-#' M-Step of the EM algorithm
-#'
-#' Maximisation step of the EM algorithm to compute hyper-parameters of all the
-#' kernels involved in Magma.
-#'
-#' @param db A tibble or data frame. Columns required: ID, Input, Output.
-#'    Additional columns for covariates can be specified.
-#' @param m_0 A vector, corresponding to the prior mean of the mean GP.
-#' @param kern_0 A kernel function, associated with the mean GP.
-#' @param kern_i A kernel function, associated with the individual GPs.
-#' @param old_hp_0 A named vector, tibble or data frame, containing the
-#'    hyper-parameters from the previous M-step (or initialisation) associated
-#'     with the mean GP.
-#' @param old_hp_i A tibble or data frame, containing the hyper-parameters
-#'    from the previous M-step (or initialisation) associated with the
-#'    individual GPs.
-#' @param post_mean A tibble, coming out of the E step, containing the Input and
-#'    associated Output of the hyper-posterior mean parameter.
-#' @param post_cov A matrix, coming out of the E step, being the hyper-posterior
-#'    covariance parameter.
-#' @param common_hp A logical value, indicating whether the set of
-#'    hyper-parameters is assumed to be common to all indiviuals.
-#' @param pen_diag A number. A jitter term, added on the diagonal to prevent
-#' numerical issues when inverting nearly singular matrices.
-#'
-#' @return A named list, containing the elements \code{hp_0}, a tibble
-#'    containing the hyper-parameters associated with the mean GP,
-#'    \code{hp_i}, a tibble containing the hyper-parameters
-#'    associated with the individual GPs.
-#'
-#' @keywords internal
-#'
-#' @examples
-#' TRUE
 m_step <- function(db,
                    m_0,
                    kern_0,
-                   kern_i,
+                   kern_t,
                    old_hp_0,
-                   old_hp_i,
+                   old_hp_t,
                    post_mean,
                    post_cov,
-                   common_hp,
+                   shared_hp_tasks,
                    pen_diag) {
 
-  list_ID <- unique(db$ID)
-  list_hp_0 <- old_hp_0 %>% names()
-  list_hp_i <- old_hp_i %>%
-    dplyr::select(-.data$ID) %>%
-    names()
+  list_ID_task <- unique(db$Task_ID)
+  output_ids_vector <- unique(db$Output_ID)
 
-  ## Detect whether the kernel_0 provides derivatives for its hyper-parameters
-  if (kern_0 %>% is.function()) {
-    if (!("deriv" %in% methods::formalArgs(kern_0))) {
-      gr_GP_mod <- NULL
-    }
-  }
+  # We don't optimise mu_0's hyperparameters
+  new_hp_0 <- old_hp_0
 
-  ## Detect whether the kernel_i provides derivatives for its hyper-parameters
-  if (kern_i %>% is.function()) {
-    if (!("deriv" %in% methods::formalArgs(kern_i))) {
-      gr_GP_mod <- NULL
-      gr_GP_mod_common_hp <- NULL
-    }
-  }
+  # =================================================================== #
+  # Case 1: HPs are shared across tasks -> one optimisation over all data
+  # =================================================================== #
+  if (shared_hp_tasks) {
+    cat("HPs are shared across tasks...\n")
 
-  ## Optimise hyper-parameters of the mean process
-  new_hp_0 <- stats::optim(
-    par = old_hp_0,
-    fn = logL_GP_mod,
-    gr = gr_GP_mod,
-    db = post_mean,
-    mean = m_0,
-    kern = kern_0,
-    post_cov = post_cov,
-    pen_diag = pen_diag,
-    method = "L-BFGS-B",
-    control = list(factr = 1e13, maxit = 25)
-  )$par %>%
-    tibble::as_tibble_row()
+    # Prepare parameters for optim() - this logic is now unified.
+    hp_per_output <- old_hp_t %>%
+      dplyr::group_by(Output_ID) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(-Task_ID, -l_u_t) %>%
+      tidyr::pivot_longer(cols = -Output_ID, names_to = "hp_name", values_to = "value") %>%
+      dplyr::mutate(specific_name = paste(hp_name, Output_ID, sep = "_")) %>%
+      dplyr::select(specific_name, value) %>%
+      tibble::deframe()
 
-  ## Check whether hyper-parameters are common to all individuals
-  if (common_hp) {
-    ## Retrieve the adequate initial hyper-parameters
-    par_i <- old_hp_i %>%
-      dplyr::select(-.data$ID) %>%
-      dplyr::slice(1)
-    ## Optimise hyper-parameters of the individual processes
-    new_hp_i <- stats::optim(
-      par = par_i,
-      fn = logL_GP_mod_common_hp,
-      gr = gr_GP_mod_common_hp,
-      db = db,
-      mean = post_mean,
-      kern = kern_i,
-      post_cov = post_cov,
-      pen_diag = pen_diag,
-      method = "L-BFGS-B",
-      control = list(factr = 1e13, maxit = 25)
+    shared_hp_l_u_t <- old_hp_t$l_u_t[1]
+    names(shared_hp_l_u_t) <- "l_u_t"
+    par <- c(hp_per_output, shared_hp_l_u_t)
+    hp_col_names <- names(par)
+
+    # A single, unified optimisation call
+    result_optim <- stats::optim(
+      par               = par,
+      fn                = logL_GP_mod_shared_tasks,
+      gr                = gr_GP_mod_shared_tasks,
+      db                = db,
+      mean              = post_mean,
+      kern              = kern_t,
+      post_cov          = post_cov,
+      pen_diag          = pen_diag,
+      hp_col_names      = hp_col_names,
+      output_ids        = output_ids_vector,
+      shared_hp_outputs = are_outputs_shared,
+      method            = "L-BFGS-B",
+      control           = list(factr = 1e13, maxit = 25)
     )$par %>%
-      tibble::as_tibble_row() %>%
-      tidyr::uncount(weights = length(list_ID)) %>%
-      dplyr::mutate("ID" = list_ID, .before = 1)
-  } else {
-    floop <- function(i) {
-      ## Extract the i-th specific inputs
-      input_i <- db %>%
-        dplyr::filter(.data$ID == i) %>%
-        dplyr::pull(.data$Reference)
-      ## Extract the mean values associated with the i-th specific inputs
-      post_mean_i <- post_mean %>%
-        dplyr::filter(.data$Reference %in% input_i) %>%
-        dplyr::pull(.data$Output)
-      ## Extract the covariance values associated with the i-th specific inputs
-      post_cov_i <- post_cov[as.character(input_i), as.character(input_i)]
-      ## Extract the data associated with the i-th individual
-      db_i <- db %>%
-        dplyr::filter(.data$ID == i) %>%
-        dplyr::select(-.data$ID)
-      ## Extract the hyper-parameters associated with the i-th individual
-      par_i <- old_hp_i %>%
-        dplyr::filter(.data$ID == i) %>%
-        dplyr::select(-.data$ID)
+      tibble::as_tibble_row()
 
-      ## Optimise hyper-parameters of the individual processes
-      stats::optim(
-        par = par_i,
-        fn = logL_GP_mod,
-        gr = gr_GP_mod,
-        db = db_i,
-        mean = post_mean_i,
-        kern = kern_i,
-        post_cov = post_cov_i,
-        pen_diag = pen_diag,
-        method = "L-BFGS-B",
-        control = list(factr = 1e13, maxit = 25)
+    # Reshape results
+    new_hp_t <- result_optim %>%
+      tidyr::pivot_longer(
+        cols = -dplyr::any_of("l_u_t"),
+        names_to = c(".value", "Output_ID"),
+        names_pattern = "(.+)_(\\d+)$"
+      ) %>%
+      tidyr::crossing(Task_ID = list_ID_task, .)
+
+    # =================================================================== #
+    # Case 2: HPs are task-specific -> loop over tasks
+    # =================================================================== #
+  } else {
+    cat("HPs are task-specific.\n")
+
+    floop <- function(t) {
+      cat(paste0("Optimizing for task ", t, "...\n"))
+      # Filter data for the current task
+      db_t <- db %>% dplyr::filter(Task_ID == t)
+
+      input_t <- db_t %>% dplyr::pull(Reference)
+
+      post_mean_t <- post_mean %>%
+        dplyr::filter(Reference %in% input_t) %>%
+        dplyr::pull(Output)
+
+      post_cov_t <- post_cov[as.character(input_t), as.character(input_t)]
+
+      old_hp_t_task <- old_hp_t %>% dplyr::filter(Task_ID == t)
+
+      # Prepare parameters for optim() for this specific task
+      hp_per_output <- old_hp_t_task %>%
+        dplyr::select(-Task_ID, -l_u_t) %>%
+        tidyr::pivot_longer(cols = -Output_ID, names_to = "hp_name", values_to = "value") %>%
+        dplyr::mutate(specific_name = paste(hp_name, Output_ID, sep = "_")) %>%
+        dplyr::select(specific_name, value) %>%
+        tibble::deframe()
+
+      shared_hp <- old_hp_t_task$l_u_t[1]
+      names(shared_hp) <- "l_u_t"
+
+      par_t <- c(hp_per_output, shared_hp)
+      hp_col_names <- names(par_t)
+
+      # Optimisation for the single task 't'
+      result_optim <- stats::optim(
+        par               = par_t,
+        fn                = logL_GP_mod,
+        gr                = gr_GP_mod,
+        db                = db_t,
+        mean              = post_mean_t,
+        kern              = kern_t,
+        post_cov          = post_cov_t,
+        pen_diag          = pen_diag,
+        hp_col_names      = hp_col_names,
+        output_ids        = output_ids_vector,
+        method            = "L-BFGS-B",
+        control           = list(factr = 1e13, maxit = 25)
       )$par %>%
-        tibble::as_tibble_row() %>%
-        return()
+        tibble::as_tibble_row()
+
+      return(result_optim)
     }
-    new_hp_i <- sapply(list_ID,
-                       floop,
-                       simplify = FALSE,
-                       USE.NAMES = TRUE) %>%
-      tibble::enframe(name = "ID") %>%
-      tidyr::unnest(cols = .data$value)
+
+    # Collect results from all tasks
+    optim_results_by_task <- sapply(list_ID_task, floop, simplify = FALSE, USE.NAMES = TRUE) %>%
+      tibble::enframe(name = "Task_ID") %>%
+      tidyr::unnest(cols = value)
+
+    # Reshape results
+    new_hp_t <- optim_results_by_task %>%
+      tidyr::pivot_longer(
+        cols = -c(Task_ID, dplyr::any_of("l_u_t")),
+        names_to = c(".value", "Output_ID"),
+        names_pattern = "(.+)_(\\d+)$"
+      )
   }
 
-  list(
-    "hp_0" = new_hp_0,
-    "hp_i" = new_hp_i
-  ) %>%
-    return()
+  # --- Final standard formatting for the output tibble ---
+  final_hp_names <- old_hp_t %>% dplyr::select(-Task_ID, -Output_ID) %>% names()
+  new_hp_t <- new_hp_t %>%
+    dplyr::select(Task_ID, Output_ID, dplyr::all_of(final_hp_names)) %>%
+    dplyr::mutate(across(c(Task_ID, Output_ID), as.character)) %>%
+    dplyr::arrange(as.numeric(Task_ID), as.numeric(Output_ID))
+
+  return(list("hp_0" = new_hp_0, "hp_t" = new_hp_t))
 }
